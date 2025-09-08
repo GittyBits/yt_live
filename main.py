@@ -4,25 +4,50 @@ import subprocess
 import requests
 import re
 from pathlib import Path
-from telegram import Bot
+from telegram import Bot, Update
+from telegram.ext import Updater, MessageHandler, Filters, CallbackContext
 
 # ====== CONFIG ======
-YOUTUBE_CHANNEL_ID = "UCxxxxxxxx"   # channel ID
 CHECK_INTERVAL = 60  # seconds
 COOKIES_FILE = "cookies.txt"
 
-# Telegram
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")  # your chat or group ID
-
-# Gofile
+CHAT_ID = os.getenv("CHAT_ID")
 GOFILE_API_TOKEN = os.getenv("GOFILE_API_TOKEN")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
+CHANNEL_FILE = Path("channel.txt")
+
+
 # ====== HELPERS ======
+def save_channel_id(text):
+    # Handle both full link and raw ID
+    if "youtube.com" in text:
+        # Extract channel id from link
+        if "/channel/" in text:
+            cid = text.split("/channel/")[1].split("/")[0]
+        elif "/@" in text:  # username URL
+            # resolve username URL to channel ID
+            html = requests.get(text).text
+            m = re.search(r'"channelId":"(UC[0-9A-Za-z_-]{21}[AQgw])"', html)
+            cid = m.group(1) if m else None
+        else:
+            cid = None
+    else:
+        cid = text  # assume raw ID
+    if cid:
+        CHANNEL_FILE.write_text(cid)
+        return cid
+    return None
+
+def load_channel_id():
+    if CHANNEL_FILE.exists():
+        return CHANNEL_FILE.read_text().strip()
+    return None
+
 def is_live(channel_id):
     url = f"https://www.youtube.com/channel/{channel_id}/live"
     r = requests.get(url)
@@ -68,24 +93,51 @@ def send_file(filepath):
         link = upload_gofile(filepath)
         send_telegram(f"File too big. Uploaded to GoFile: {link}")
 
+
+# ====== TELEGRAM HANDLER ======
+def handle_message(update: Update, context: CallbackContext):
+    text = update.message.text.strip()
+    cid = save_channel_id(text)
+    if cid:
+        update.message.reply_text(f"✅ Channel set to {cid}. Bot will monitor it now.")
+    else:
+        update.message.reply_text("❌ Could not extract channel ID. Please try again with a valid link.")
+
+
 # ====== MAIN LOOP ======
-if __name__ == "__main__":
-    send_telegram("Bot started. Monitoring channel...")
+def main():
+    updater = Updater(TELEGRAM_TOKEN, use_context=True)
+    dp = updater.dispatcher
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
+    updater.start_polling()
+
+    send_telegram("Bot started ✅")
+
     while True:
         try:
-            if is_live(YOUTUBE_CHANNEL_ID):
-                live_url = extract_live_url(YOUTUBE_CHANNEL_ID)
+            channel_id = load_channel_id()
+            if not channel_id:
+                send_telegram("Please send me the YouTube channel link or ID to monitor.")
+                time.sleep(60)
+                continue
+
+            if is_live(channel_id):
+                live_url = extract_live_url(channel_id)
                 if live_url:
-                    send_telegram(f"Live detected! Recording: {live_url}")
+                    send_telegram(f"🔴 Live detected! Recording: {live_url}")
                     record_stream(live_url)
                     # after recording, find latest file
                     files = sorted(DOWNLOAD_DIR.glob("*.mp4"), key=os.path.getmtime, reverse=True)
                     if files:
                         latest = files[0]
-                        send_telegram(f"Recording finished: {latest.name}")
+                        send_telegram(f"✅ Recording finished: {latest.name}")
                         send_file(latest)
             else:
                 print("No live stream right now.")
         except Exception as e:
-            send_telegram(f"Error: {e}")
+            send_telegram(f"⚠️ Error: {e}")
         time.sleep(CHECK_INTERVAL)
+
+
+if __name__ == "__main__":
+    main()
